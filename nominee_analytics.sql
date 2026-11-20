@@ -1,191 +1,204 @@
--- 1. Count of Roles per Person (by Role Type)
+-- ============================================================================
+-- Film nominee analytics (BigQuery Standard SQL)
+-- Tables
+--   nominee_information.core_table : one row per nominee (name, top_genre, birthday, id)
+--   nominee_filmography.core_table : one row per credit (name, amg_movie_id, movie_title,
+--                                    role_type, rating, year, id)
+--
+-- IMPORTANT: filmography.id is a running row number, NOT the nominee id.
+-- The two tables are joined on `name`. (An earlier version joined on id,
+-- which matched credits to the wrong people.)
+-- `rating` is missing for ~22 % of credits. AVG/STDDEV ignore NULLs, and
+-- minimum sample sizes are applied where averages are ranked.
+-- ============================================================================
 
+
+-- 0. Data quality checks
+SELECT
+  (SELECT COUNT(*) FROM `main-data-hub.nominee_filmography.core_table`)                        AS credits,
+  (SELECT COUNTIF(rating IS NULL) FROM `main-data-hub.nominee_filmography.core_table`)         AS credits_without_rating,
+  (SELECT COUNT(*) FROM `main-data-hub.nominee_information.core_table`)                        AS nominees,
+  (SELECT COUNT(*) - COUNT(DISTINCT amg_person_id)
+   FROM `main-data-hub.nominee_information.core_table`)                                        AS duplicate_person_ids;
+-- -> 2 people are stored twice under different spellings (e.g. "Daniel Day Lewis" / "Daniel Day-Lewis")
+
+
+-- 1. Number of credits per person and role type
 SELECT
   f.name,
   i.top_genre,
   f.role_type,
-  COUNT(1) AS role_count
-FROM `main-data-hub.nominee_filmography.core_table`  AS f
-JOIN `main-data-hub.nominee_information.core_table` AS i
-  ON f.id = i.id
-GROUP BY f.name, i.top_genre, f.role_type
-ORDER BY role_count DESC;
-
-
-
--- 2. Average Movie Rating per Nominee
-
-SELECT
-  f.name,
-  ROUND(AVG(f.rating), 2) AS avg_rating,
-  COUNT(1) AS films_count
+  COUNT(*) AS credits
 FROM `main-data-hub.nominee_filmography.core_table` AS f
-GROUP BY f.name
-HAVING films_count > 2 
+JOIN `main-data-hub.nominee_information.core_table` AS i
+  ON f.name = i.name
+GROUP BY f.name, i.top_genre, f.role_type
+ORDER BY credits DESC;
+
+
+-- 2. Highest average rating per nominee (min. 10 rated films)
+SELECT
+  name,
+  ROUND(AVG(rating), 2) AS avg_rating,
+  COUNT(rating)         AS rated_films
+FROM `main-data-hub.nominee_filmography.core_table`
+GROUP BY name
+HAVING COUNT(rating) >= 10
 ORDER BY avg_rating DESC
 LIMIT 10;
 
 
--- 3. Films per Year Trend
-
+-- 3. Films per decade
 SELECT
-  SAFE_CAST(f.year AS INT64) AS year,
-  COUNT(DISTINCT f.amg_movie_id) AS films_count
-FROM `main-data-hub.nominee_filmography.core_table` AS f
-GROUP BY year
-ORDER BY year;
+  CAST(FLOOR(year / 10) * 10 AS INT64) AS decade,
+  COUNT(DISTINCT amg_movie_id)         AS films
+FROM `main-data-hub.nominee_filmography.core_table`
+WHERE year IS NOT NULL
+GROUP BY decade
+ORDER BY decade;
 
 
-
--- 4. Top Genres by Number of Nominees
-
+-- 4. Nominees per top genre, with average film rating
 SELECT
   i.top_genre,
-  COUNT(DISTINCT i.id) AS nominee_count
+  COUNT(DISTINCT i.name)  AS nominees,
+  ROUND(AVG(f.rating), 2) AS avg_film_rating
 FROM `main-data-hub.nominee_information.core_table` AS i
+LEFT JOIN `main-data-hub.nominee_filmography.core_table` AS f
+  ON f.name = i.name
 GROUP BY i.top_genre
-ORDER BY nominee_count DESC;
+ORDER BY nominees DESC;
 
 
--- 5. Nominee Age Distribution
-
-SELECT
-  name,
-  DATE_DIFF("1925-01-01", DATE(birthday), YEAR) AS current_age
-FROM `main-data-hub.nominee_information.core_table`
-WHERE birthday IS NOT NULL
-ORDER BY current_age DESC;
-
--- 6. Top-Rated Movie per Genre
-
-WITH best_per_nominee AS (
+-- 5. Age at debut (first credited film) distribution
+WITH debut AS (
   SELECT
-    f.id,
-    f.name,
-    i.top_genre,
-    f.movie_title,
-    f.rating,
-    ROW_NUMBER() OVER (PARTITION BY f.id ORDER BY f.rating DESC) AS rn
-  FROM `main-data-hub.nominee_filmography.core_table`  AS f
+    i.name,
+    CAST(MIN(f.year) AS INT64) - EXTRACT(YEAR FROM DATE(i.birthday)) AS age_at_debut
+  FROM `main-data-hub.nominee_filmography.core_table` AS f
   JOIN `main-data-hub.nominee_information.core_table` AS i
-    ON f.id = i.id
+    ON f.name = i.name
+  WHERE i.birthday IS NOT NULL AND f.year IS NOT NULL
+  GROUP BY i.name, i.birthday
 )
 SELECT
-  top_genre,
-  name,
-  movie_title,
-  rating
-FROM best_per_nominee
-WHERE rn = 1
-ORDER BY top_genre, rating DESC;
+  CASE
+    WHEN age_at_debut < 20 THEN '1) under 20'
+    WHEN age_at_debut < 25 THEN '2) 20-24'
+    WHEN age_at_debut < 30 THEN '3) 25-29'
+    WHEN age_at_debut < 40 THEN '4) 30-39'
+    ELSE                        '5) 40+'
+  END      AS age_band,
+  COUNT(*) AS nominees
+FROM debut
+GROUP BY age_band
+ORDER BY age_band;
 
 
--- 7. Year‑Over‑Year Rating Growth per Nominee
-
-WITH yearly_avg AS (
+-- 6. Top-rated film per genre (genre = nominee's top genre)
+WITH ranked AS (
   SELECT
+    i.top_genre,
+    f.movie_title,
     f.name,
-    CAST(f.year AS INT64) AS year,
-    AVG(f.rating) AS avg_rating
+    f.rating,
+    ROW_NUMBER() OVER (PARTITION BY i.top_genre ORDER BY f.rating DESC, f.movie_title) AS rn
   FROM `main-data-hub.nominee_filmography.core_table` AS f
-  GROUP BY f.name, year
-),
-growth AS (
-  SELECT
-    name,
-    year,
-    avg_rating,
-    LAG(avg_rating) OVER (PARTITION BY name ORDER BY year) AS prev_avg
-  FROM yearly_avg
+  JOIN `main-data-hub.nominee_information.core_table` AS i
+    ON f.name = i.name
+  WHERE f.rating IS NOT NULL
+)
+SELECT top_genre, movie_title, name, rating
+FROM ranked
+WHERE rn = 1
+ORDER BY top_genre;
+
+
+-- 7. Year-over-year change in average rating per nominee
+WITH yearly AS (
+  SELECT name, CAST(year AS INT64) AS year, AVG(rating) AS avg_rating
+  FROM `main-data-hub.nominee_filmography.core_table`
+  WHERE rating IS NOT NULL AND year IS NOT NULL
+  GROUP BY name, year
 )
 SELECT
   name,
   year,
-  ROUND((avg_rating - prev_avg) * 100 / NULLIF(prev_avg,0), 2) AS pct_change
-FROM growth
-WHERE prev_avg IS NOT NULL
+  ROUND(avg_rating, 2) AS avg_rating,
+  ROUND(100 * SAFE_DIVIDE(avg_rating - LAG(avg_rating) OVER w, LAG(avg_rating) OVER w), 1) AS pct_change_vs_prev_active_year
+FROM yearly
+WINDOW w AS (PARTITION BY name ORDER BY year)
 ORDER BY name, year;
 
 
--- 8. Who are the most “central” collaborators?
-
+-- 8. Most connected nominees (distinct fellow nominees they shared a film with)
 WITH credits AS (
-  SELECT
-    id,
-    amg_movie_id,
-    id AS nominee_id
+  SELECT DISTINCT name, amg_movie_id
   FROM `main-data-hub.nominee_filmography.core_table`
-),
-pairs AS (
-  SELECT 
-    a.nominee_id AS n1,
-    b.nominee_id AS n2
-  FROM credits AS a
-  JOIN credits AS b
-    ON a.amg_movie_id = b.amg_movie_id
-   AND a.id <> b.id
-),
-distinct_counts AS (
-  SELECT 
-    n1 AS nominee_id,
-    COUNT(DISTINCT n2) AS distinct_collabs
-  FROM pairs
-  GROUP BY n1
 )
-SELECT 
-  i.name,
-  dc.distinct_collabs
-FROM distinct_counts AS dc
-JOIN `main-data-hub.nominee_information.core_table` AS i
-  ON dc.nominee_id = i.id
-ORDER BY dc.distinct_collabs DESC
+SELECT
+  a.name,
+  COUNT(DISTINCT b.name) AS distinct_collaborators
+FROM credits AS a
+JOIN credits AS b
+  ON a.amg_movie_id = b.amg_movie_id
+ AND a.name <> b.name
+GROUP BY a.name
+ORDER BY distinct_collaborators DESC
 LIMIT 10;
 
 
--- 9. Rating Volatility: Who has the most inconsistent film scores?
-
+-- 9. Rating volatility: most inconsistent careers (min. 10 rated films)
 SELECT
-  f.name,
-  ROUND(STDDEV_POP(f.rating), 2) AS rating_stddev,
-  COUNT(1) AS films_count
-FROM `main-data-hub.nominee_filmography.core_table` AS f
-GROUP BY f.name
-HAVING films_count > 3 
+  name,
+  ROUND(STDDEV_POP(rating), 2) AS rating_stddev,
+  ROUND(AVG(rating), 2)        AS avg_rating,
+  COUNT(rating)                AS rated_films
+FROM `main-data-hub.nominee_filmography.core_table`
+GROUP BY name
+HAVING COUNT(rating) >= 10
 ORDER BY rating_stddev DESC
 LIMIT 10;
 
--- 10. Predictive Signal: Does Debut Age Predict Average Rating?
 
-
-WITH debut_info AS (
+-- 10. Does age at debut predict average rating? (Pearson correlation)
+WITH per_person AS (
   SELECT
-    f.id,
-    i.birthday,
-    MIN(f.year) AS debut_year
+    i.name,
+    CAST(MIN(f.year) AS INT64) - EXTRACT(YEAR FROM DATE(i.birthday)) AS age_at_debut,
+    AVG(f.rating)                                                    AS avg_rating,
+    COUNT(f.rating)                                                  AS rated_films
   FROM `main-data-hub.nominee_filmography.core_table` AS f
   JOIN `main-data-hub.nominee_information.core_table` AS i
-    ON f.id = i.id
+    ON f.name = i.name
   WHERE i.birthday IS NOT NULL
-  GROUP BY f.id, i.birthday
-),
-avg_rating AS (
-  SELECT
-    id,
-    AVG(rating) AS avg_rating
-  FROM `main-data-hub.nominee_filmography.core_table`
-  GROUP BY id
-),
-joined AS (
-  SELECT
-    d.id,
-    DATE_DIFF(DATE(CONCAT(d.debut_year,'-01-01')), DATE(d.birthday), YEAR)
-      AS age_at_debut,
-    ar.avg_rating
-  FROM debut_info AS d
-  JOIN avg_rating AS ar
-    ON d.id = ar.id
+  GROUP BY i.name, i.birthday
 )
 SELECT
-  ROUND(CORR(age_at_debut, avg_rating),2) AS corr_age_vs_rating,
-  COUNT(1) AS sample_size
-FROM joined;
+  ROUND(CORR(age_at_debut, avg_rating), 2) AS corr_debut_age_vs_rating,
+  COUNT(*)                                 AS nominees
+FROM per_person
+WHERE rated_films >= 5;
+
+
+-- 11. Do ratings decline over a career? (avg rating by film number)
+WITH numbered AS (
+  SELECT
+    name,
+    rating,
+    ROW_NUMBER() OVER (PARTITION BY name ORDER BY year, amg_movie_id) AS film_no
+  FROM `main-data-hub.nominee_filmography.core_table`
+  WHERE rating IS NOT NULL AND year IS NOT NULL
+)
+SELECT
+  CASE
+    WHEN film_no <= 10 THEN '1) films 1-10'
+    WHEN film_no <= 30 THEN '2) films 11-30'
+    WHEN film_no <= 60 THEN '3) films 31-60'
+    ELSE                    '4) film 61+'
+  END                   AS career_stage,
+  ROUND(AVG(rating), 2) AS avg_rating,
+  COUNT(*)              AS films
+FROM numbered
+GROUP BY career_stage
+ORDER BY career_stage;
